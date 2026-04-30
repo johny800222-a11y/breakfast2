@@ -262,7 +262,8 @@ def fetch_ohlcv(exch, symbol: str, tf: str, limit: int = 300) -> pd.DataFrame:
 
 def get_top_symbols(exch, n: int) -> list[str]:
     exch.load_markets()
-    tickers = exch.fetch_tickers()
+    # 只拉 USDT 永續合約，減少請求量
+    tickers = exch.fetch_tickers(params={"type": "future"})
     cands = [
         (sym, float(t.get("quoteVolume") or 0))
         for sym, t in tickers.items()
