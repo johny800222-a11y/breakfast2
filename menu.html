@@ -137,7 +137,7 @@
 
   .card-name { font-size: 14px; font-weight: 700; color: #1a1a1a; }
   .card-desc { font-size: 10px; color: #999; line-height: 1.4; }
-  .card-price { font-size: 14px; font-weight: 700; color: #e88a38; }
+  .card-img img { width: 100%; height: 100%; object-fit: cover; }
 
   .add-btn {
     margin-top: 6px;
@@ -611,13 +611,15 @@ function renderGrid() {
   }
   document.getElementById('grid').innerHTML = MENU.map(item => {
     const soldOut = item.quantity <= 0;
+    const imgHtml = item.image
+      ? `<img src="${item.image}" alt="${item.name}">`
+      : item.emoji;
     return `
     <div class="card">
-      <div class="card-img">${item.emoji}</div>
+      <div class="card-img">${imgHtml}</div>
       <div class="card-body">
         <div class="card-name">${item.name}</div>
         <div class="card-desc">${item.desc}</div>
-        <div class="card-price">$${item.price}</div>
         ${soldOut ? '<span class="out-badge">已售完</span>' : ''}
         <button class="add-btn" ${soldOut ? 'disabled' : ''} onclick="openModal(${item.id})">
           ${soldOut ? '已售完' : '加入購物車'}

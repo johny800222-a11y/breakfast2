@@ -72,6 +72,46 @@ tr:last-child td { border-bottom: none; }
 .form-group input:focus, .form-group select:focus { border-color: #e88a38; }
 .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 
+/* 圖片上傳 */
+.img-upload-box {
+  border: 2px dashed #e0d8d0;
+  border-radius: 12px;
+  padding: 16px;
+  text-align: center;
+  cursor: pointer;
+  margin-bottom: 14px;
+  transition: border-color .18s;
+  background: #faf8f5;
+  position: relative;
+}
+.img-upload-box:hover { border-color: #e88a38; }
+.img-upload-box input[type=file] {
+  position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+  border: none; padding: 0;
+}
+.img-preview {
+  width: 80px; height: 80px;
+  border-radius: 10px;
+  object-fit: cover;
+  margin-bottom: 6px;
+  display: block;
+  margin: 0 auto 6px;
+}
+.img-placeholder { font-size: 36px; margin-bottom: 4px; }
+.img-upload-hint { font-size: 12px; color: #aaa; }
+.img-clear-btn {
+  margin-top: 6px;
+  border: none;
+  background: #fde8e8;
+  color: #c62828;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 999px;
+  cursor: pointer;
+  display: none;
+}
+
 /* Log table */
 .action-badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; }
 .action-in    { background: #e8f5e9; color: #2e7d32; }
@@ -121,10 +161,10 @@ tr:last-child td { border-bottom: none; }
     </div>
     <table id="items-table">
       <thead><tr>
-        <th></th><th>品名</th><th>分類</th><th>售價</th><th>庫存</th><th>操作</th>
+        <th></th><th>品名</th><th>分類</th><th>庫存</th><th>操作</th>
       </tr></thead>
       <tbody id="items-tbody">
-        <tr><td colspan="6" class="empty-msg">載入中…</td></tr>
+        <tr><td colspan="5" class="empty-msg">載入中…</td></tr>
       </tbody>
     </table>
   </div>
@@ -155,9 +195,23 @@ tr:last-child td { border-bottom: none; }
   <div class="modal">
     <h3 id="item-modal-title">新增品項</h3>
     <input type="hidden" id="edit-id">
+
+    <!-- 圖片上傳（最上方）-->
+    <div class="form-group">
+      <label>品項圖片</label>
+      <div class="img-upload-box" id="img-upload-box">
+        <input type="file" id="f-image-file" accept="image/*" onchange="handleImageUpload(this)">
+        <div id="img-preview-wrap">
+          <div class="img-placeholder">📷</div>
+          <div class="img-upload-hint">點擊上傳圖片<br><span style="color:#bbb">（支援 JPG / PNG）</span></div>
+        </div>
+      </div>
+      <button class="img-clear-btn" id="img-clear-btn" onclick="clearImage()">✕ 移除圖片</button>
+    </div>
+
     <div class="form-row">
       <div class="form-group">
-        <label>Emoji 圖示</label>
+        <label>Emoji（無圖時顯示）</label>
         <input id="f-emoji" type="text" placeholder="🍵" maxlength="4">
       </div>
       <div class="form-group">
@@ -172,15 +226,9 @@ tr:last-child td { border-bottom: none; }
       <label>品名</label>
       <input id="f-name" type="text" placeholder="例：紅茶">
     </div>
-    <div class="form-row">
-      <div class="form-group">
-        <label>售價（元）</label>
-        <input id="f-price" type="number" placeholder="25">
-      </div>
-      <div class="form-group" id="init-stock-group">
-        <label>初始庫存</label>
-        <input id="f-stock" type="number" placeholder="0">
-      </div>
+    <div class="form-group" id="init-stock-group">
+      <label>初始庫存</label>
+      <input id="f-stock" type="number" placeholder="0">
     </div>
     <div class="form-group">
       <label>說明文字</label>
@@ -237,14 +285,16 @@ async function loadItems() {
   const rows = await fetch('/api/inventory').then(r=>r.json());
   allItems = rows;
   const tbody = document.getElementById('items-tbody');
-  if (!rows.length) { tbody.innerHTML = '<tr><td colspan="6" class="empty-msg">尚無品項</td></tr>'; return; }
+  if (!rows.length) { tbody.innerHTML = '<tr><td colspan="5" class="empty-msg">尚無品項</td></tr>'; return; }
   tbody.innerHTML = rows.map(r => {
     const qClass = r.quantity >= 5 ? 'qty-green' : r.quantity >= 1 ? 'qty-orange' : 'qty-red';
+    const thumb = r.image
+      ? `<img src="${r.image}" style="width:36px;height:36px;border-radius:6px;object-fit:cover;">`
+      : `<span style="font-size:22px">${r.emoji}</span>`;
     return `<tr>
-      <td class="emoji-cell">${r.emoji}</td>
+      <td class="emoji-cell">${thumb}</td>
       <td><strong>${r.name}</strong></td>
       <td>${r.category}</td>
-      <td>$${r.price ?? '—'}</td>
       <td><span class="qty-badge ${qClass}">${r.quantity}</span></td>
       <td>
         <button class="btn btn-ghost btn-sm" onclick="openEditModal(${r.id})">編輯</button>
@@ -254,16 +304,49 @@ async function loadItems() {
   }).join('');
 }
 
+let currentImageData = '';   // base64 data URL
+
+function handleImageUpload(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    currentImageData = e.target.result;
+    setImagePreview(currentImageData);
+  };
+  reader.readAsDataURL(file);
+}
+
+function setImagePreview(src) {
+  const wrap = document.getElementById('img-preview-wrap');
+  const clearBtn = document.getElementById('img-clear-btn');
+  if (src) {
+    wrap.innerHTML = `<img class="img-preview" src="${src}">`;
+    clearBtn.style.display = 'inline-block';
+  } else {
+    wrap.innerHTML = `<div class="img-placeholder">📷</div>
+      <div class="img-upload-hint">點擊上傳圖片<br><span style="color:#bbb">（支援 JPG / PNG）</span></div>`;
+    clearBtn.style.display = 'none';
+  }
+}
+
+function clearImage() {
+  currentImageData = '';
+  document.getElementById('f-image-file').value = '';
+  setImagePreview('');
+}
+
 function openAddModal() {
   document.getElementById('item-modal-title').textContent = '新增品項';
   document.getElementById('edit-id').value = '';
   document.getElementById('f-emoji').value = '';
   document.getElementById('f-name').value  = '';
-  document.getElementById('f-price').value = '';
   document.getElementById('f-desc').value  = '';
   document.getElementById('f-stock').value = '20';
   document.getElementById('f-category').value = '飲料';
   document.getElementById('init-stock-group').style.display = '';
+  currentImageData = '';
+  setImagePreview('');
   document.getElementById('item-modal').classList.add('show');
 }
 
@@ -271,13 +354,14 @@ function openEditModal(id) {
   const item = allItems.find(i => i.id === id);
   if (!item) return;
   document.getElementById('item-modal-title').textContent = '編輯品項';
-  document.getElementById('edit-id').value   = id;
-  document.getElementById('f-emoji').value   = item.emoji;
-  document.getElementById('f-name').value    = item.name;
-  document.getElementById('f-price').value   = item.price;
-  document.getElementById('f-desc').value    = item.desc || '';
-  document.getElementById('f-category').value= item.category;
+  document.getElementById('edit-id').value    = id;
+  document.getElementById('f-emoji').value    = item.emoji;
+  document.getElementById('f-name').value     = item.name;
+  document.getElementById('f-desc').value     = item.desc || '';
+  document.getElementById('f-category').value = item.category;
   document.getElementById('init-stock-group').style.display = 'none';
+  currentImageData = item.image || '';
+  setImagePreview(currentImageData);
   document.getElementById('item-modal').classList.add('show');
 }
 
@@ -285,16 +369,19 @@ function closeItemModal(e) { if (e.target.id === 'item-modal') closeItemModalDir
 function closeItemModalDirect() { document.getElementById('item-modal').classList.remove('show'); }
 
 async function saveItem() {
-  const id    = document.getElementById('edit-id').value;
-  const body  = {
-    name:          document.getElementById('f-name').value.trim(),
-    price:         parseInt(document.getElementById('f-price').value),
+  const id   = document.getElementById('edit-id').value;
+  const name = document.getElementById('f-name').value.trim();
+  if (!name) { showToast('請填寫品名'); return; }
+
+  const body = {
+    name,
+    price:         0,
     desc:          document.getElementById('f-desc').value.trim(),
     emoji:         document.getElementById('f-emoji').value.trim() || '🍽',
+    image:         currentImageData,
     category:      document.getElementById('f-category').value,
     initial_stock: parseInt(document.getElementById('f-stock').value) || 0,
   };
-  if (!body.name || !body.price) { showToast('請填寫品名和售價'); return; }
 
   const url    = id ? `/api/menu/${id}` : '/api/menu';
   const method = id ? 'PUT' : 'POST';
@@ -319,8 +406,11 @@ async function loadInventory() {
   if (!rows.length) { grid.innerHTML = '<div class="empty-msg">尚無品項</div>'; return; }
   grid.innerHTML = rows.map(r => {
     const cls = r.quantity >= 5 ? 'green' : r.quantity >= 1 ? 'orange' : 'red';
+    const imgHtml = r.image
+      ? `<img src="${r.image}" style="width:56px;height:56px;border-radius:10px;object-fit:cover;margin-bottom:6px;">`
+      : `<div class="inv-emoji">${r.emoji}</div>`;
     return `<div class="inv-card">
-      <div class="inv-emoji">${r.emoji}</div>
+      ${imgHtml}
       <div class="inv-name">${r.name}</div>
       <div class="inv-qty ${cls}">${r.quantity}</div>
       <div class="inv-btns">

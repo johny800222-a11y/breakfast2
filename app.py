@@ -46,9 +46,10 @@ def init_db():
         CREATE TABLE IF NOT EXISTS menu_items (
             id       INTEGER PRIMARY KEY AUTOINCREMENT,
             name     TEXT NOT NULL,
-            price    INTEGER NOT NULL,
+            price    INTEGER NOT NULL DEFAULT 0,
             desc     TEXT DEFAULT '',
             emoji    TEXT DEFAULT '🍽',
+            image    TEXT DEFAULT '',
             category TEXT DEFAULT '飲料',
             active   INTEGER DEFAULT 1
         );
@@ -92,6 +93,11 @@ def init_db():
             cur.execute("INSERT INTO menu_items(name,price,desc,emoji,category) VALUES(?,?,?,?,?)", s)
             item_id = cur.lastrowid
             cur.execute("INSERT INTO inventory(item_id,quantity) VALUES(?,?)", (item_id, 20))
+    # 舊資料庫補欄位（migration）
+    try:
+        cur.execute("ALTER TABLE menu_items ADD COLUMN image TEXT DEFAULT ''")
+    except Exception:
+        pass
     con.commit()
     con.close()
 
@@ -129,7 +135,7 @@ def health(): return "ok", 200
 def api_menu():
     db = get_db()
     rows = db.execute("""
-        SELECT m.id, m.name, m.price, m.desc, m.emoji, m.category,
+        SELECT m.id, m.name, m.price, m.desc, m.emoji, m.image, m.category,
                COALESCE(i.quantity,0) AS quantity
         FROM menu_items m
         LEFT JOIN inventory i ON i.item_id = m.id
@@ -143,8 +149,9 @@ def api_menu_add():
     d = request.json
     db = get_db()
     cur = db.execute(
-        "INSERT INTO menu_items(name,price,desc,emoji,category) VALUES(?,?,?,?,?)",
-        (d["name"], d["price"], d.get("desc",""), d.get("emoji","🍽"), d.get("category","飲料"))
+        "INSERT INTO menu_items(name,price,desc,emoji,image,category) VALUES(?,?,?,?,?,?)",
+        (d["name"], d.get("price", 0), d.get("desc",""),
+         d.get("emoji","🍽"), d.get("image",""), d.get("category","飲料"))
     )
     item_id = cur.lastrowid
     init_qty = int(d.get("initial_stock", 0))
@@ -161,7 +168,7 @@ def api_menu_update(item_id):
     db = get_db()
     fields = []
     vals   = []
-    for col in ("name","price","desc","emoji","category"):
+    for col in ("name","price","desc","emoji","image","category"):
         if col in d:
             fields.append(f"{col}=?")
             vals.append(d[col])
@@ -184,7 +191,7 @@ def api_menu_delete(item_id):
 def api_inventory():
     db = get_db()
     rows = db.execute("""
-        SELECT m.id, m.name, m.price, m.desc, m.emoji, m.category,
+        SELECT m.id, m.name, m.price, m.desc, m.emoji, m.image, m.category,
                COALESCE(i.quantity,0) AS quantity
         FROM menu_items m
         LEFT JOIN inventory i ON i.item_id = m.id
