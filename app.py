@@ -240,6 +240,7 @@ def api_order():
     items  = d.get("items", [])
     wishes = d.get("wishes", [])
     total  = d.get("total", 0)
+    person = d.get("person", "")
     db     = get_db()
 
     # 儲存訂單
@@ -259,18 +260,16 @@ def api_order():
 
     db.commit()
 
-    # Telegram 通知
+    # Telegram 通知（只發一則）
     now = datetime.now().strftime("%m/%d %H:%M")
-    msg = f"🍱 *孩子的明日餐點訂單*\n📅 {now}\n{'─'*20}\n"
+    person_emoji = "👧" if person == "QUEENA" else "👦"
+    person_line  = f"{person_emoji} *{person}*\n" if person else ""
+    msg = f"🍱 *明日餐點訂單*\n{person_line}📅 {now}\n{'─'*20}\n"
     if items:
         msg += "\n📋 *點餐清單*\n"
         for it in items:
-            msg += f"{it['emoji']} {it['name']} x{it['qty']}（{it['ice']}・{it['sugar']}）${it['price']*it['qty']}\n"
-        msg += f"\n💰 *合計：${total}*\n"
-    if wishes:
-        msg += "\n⭐ *許願清單*\n"
-        for w in wishes:
-            msg += f"• {w}\n"
+            msg += f"{it['emoji']} {it['name']} x{it['qty']}　${it['price']*it['qty']}\n"
+        msg += f"\n💰 *合計：${total}*"
     send_telegram(msg)
 
     return jsonify({"ok": True})

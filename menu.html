@@ -707,22 +707,7 @@ async function submitOrder() {
   btn.disabled = true;
   btn.textContent = '傳送中⋯';
 
-  const now = new Date();
-  const dateStr = `${now.getMonth()+1}/${now.getDate()} ${now.getHours()}:${String(now.getMinutes()).padStart(2,'0')}`;
-  const personEmoji = currentPerson === 'QUEENA' ? '👧' : '👦';
   const total = cart.reduce((s, c) => s + c.item.price * c.qty, 0);
-
-  let msg = `🍱 *明日餐點訂單*\n`;
-  msg += `${personEmoji} *${currentPerson}*\n`;
-  msg += `📅 ${dateStr}\n`;
-  msg += `${'─'.repeat(20)}\n\n`;
-  msg += `*📋 點餐清單*\n`;
-  cart.forEach(c => {
-    msg += `${c.item.emoji} ${c.item.name} x${c.qty}　$${c.item.price * c.qty}\n`;
-  });
-  msg += `\n💰 *合計：$${total}*`;
-
-  // 同時送後端存庫存
   const payload = {
     person: currentPerson,
     items: cart.map(c => ({
@@ -739,28 +724,19 @@ async function submitOrder() {
   };
 
   try {
-    // 送 Telegram
-    const tgRes = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: TG_CHAT_ID, text: msg, parse_mode: 'Markdown' })
-    });
-    const tgData = await tgRes.json();
-
-    // 送後端
-    await fetch(`${API_BASE}/api/order`, {
+    const res = await fetch(`${API_BASE}/api/order`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
-    }).catch(() => {});  // 後端失敗不影響前端
-
-    if (tgData.ok) {
+    });
+    const data = await res.json();
+    if (data.ok) {
       cart = [];
       updateBadge();
       closeCartDirect();
       showToast('📲 已傳送給爸媽！');
     } else {
-      throw new Error(tgData.description);
+      throw new Error('server error');
     }
   } catch (err) {
     console.error(err);
