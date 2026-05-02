@@ -812,13 +812,26 @@ import threading
 
 def _cmd_listener(tg: "Telegram") -> None:
     """背景執行緒：輪詢 Telegram 訊息，回覆指令"""
-    offset = 0
+    log.info("cmd_listener thread started")
     url_get = f"https://api.telegram.org/bot{tg.token}/getUpdates"
+
+    # 啟動時跳過所有舊的 pending updates，避免處理過期指令
+    offset = 0
+    try:
+        r = requests.get(url_get, params={"offset": -1, "timeout": 0}, timeout=10)
+        if r.ok:
+            results = r.json().get("result", [])
+            if results:
+                offset = results[-1]["update_id"] + 1
+                log.info(f"cmd_listener: 跳過 pending updates，初始 offset={offset}")
+    except Exception as e:
+        log.warning(f"cmd_listener init offset failed: {e}")
 
     while True:
         try:
-            r = requests.get(url_get, params={"offset": offset, "timeout": 30}, timeout=35)
+            r = requests.get(url_get, params={"offset": offset, "timeout": 30}, timeout=40)
             if not r.ok:
+                log.warning(f"getUpdates HTTP {r.status_code}")
                 time.sleep(5)
                 continue
             for upd in r.json().get("result", []):
@@ -906,7 +919,7 @@ def _cmd_listener(tg: "Telegram") -> None:
                     except Exception as we:
                         tg.send(f"⚠️ 觀察名單掃描失敗: {we}")
 
-                elif text == "/help":
+                elif text.lower() in ("/help", "/說明"):
                     tg.send(
                         "📖 <b>可用指令</b>\n"
                         "/持倉 — 顯示目前所有持倉\n"
@@ -920,6 +933,16 @@ def _cmd_listener(tg: "Telegram") -> None:
             time.sleep(5)
 
 
+def _cmd_listener_supervised(tg: "Telegram") -> None:
+    """守護 cmd_listener:崩潰自動重啟"""
+    while True:
+        try:
+            _cmd_listener(tg)
+        except Exception as e:
+            log.exception(f"cmd_listener crashed, restarting in 10s: {e}")
+            time.sleep(10)
+
+
 # ═══════════════════════════════════════════════════════════════
 # SCHEDULER — 每 SCAN_INTERVAL_SEC 秒掃一次，立即下單
 # ═══════════════════════════════════════════════════════════════
@@ -928,9 +951,10 @@ def main() -> None:
     tg              = Telegram(TG_TOKEN, TG_CHAT_ID)
     last_status_ts  = None   # 上次發狀態報告的時間
 
-    # 啟動指令監聽執行緒
-    t = threading.Thread(target=_cmd_listener, args=(tg,), daemon=True)
+    # 啟動指令監聽執行緒（含崩潰重啟）
+    t = threading.Thread(target=_cmd_listener_supervised, args=(tg,), daemon=True)
     t.start()
+    log.info("cmd_listener supervisor thread started")
 
     tg.on_start(PAPER_MODE)
     log.info("=" * 60)
