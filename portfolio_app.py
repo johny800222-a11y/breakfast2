@@ -38,22 +38,18 @@ app = Flask(__name__, static_folder=str(BASE_DIR))
 _gist_cache: dict = {}
 _gist_cache_ts: float = 0.0
 
+GIST_RAW_URL = f"https://gist.githubusercontent.com/johny800222-a11y/{GIST_ID}/raw/{GIST_FILENAME}"
+
 def _gist_get() -> dict | None:
-    """從 GitHub Gist 讀取 portfolio 狀態，cache 30 秒"""
+    """從 GitHub Gist public raw URL 讀取 portfolio 狀態，cache 30 秒（不需要 token）"""
     global _gist_cache, _gist_cache_ts
     now = time.time()
     if _gist_cache and now - _gist_cache_ts < 30:
         return _gist_cache
     try:
-        r = _requests.get(
-            f"https://api.github.com/gists/{GIST_ID}",
-            headers={"Authorization": f"token {GITHUB_TOKEN}",
-                     "Accept": "application/vnd.github+json"},
-            timeout=8,
-        )
+        r = _requests.get(GIST_RAW_URL, timeout=8)
         if r.ok:
-            raw = r.json()["files"][GIST_FILENAME]["content"]
-            data = json.loads(raw)
+            data = json.loads(r.text)
             _gist_cache.update(data)
             _gist_cache_ts = now
             return data
