@@ -321,6 +321,30 @@ def api_crypto():
     })
 
 
+@app.route("/api/debug")
+def api_debug():
+    """排錯用：顯示執行環境狀態"""
+    import os
+    gist_test = None
+    gist_err = None
+    try:
+        r = _requests.get(GIST_RAW_URL, timeout=8)
+        gist_test = {"status": r.status_code, "ok": r.ok, "len": len(r.text), "preview": r.text[:100]}
+    except Exception as e:
+        gist_err = str(e)
+
+    return jsonify({
+        "GIST_RAW_URL"     : GIST_RAW_URL,
+        "GIST_ID"          : GIST_ID,
+        "GITHUB_TOKEN_set" : bool(GITHUB_TOKEN),
+        "BOT_STATE_exists" : BOT_STATE_FILE.exists(),
+        "BOT_STATE_path"   : str(BOT_STATE_FILE),
+        "gist_fetch"       : gist_test,
+        "gist_err"         : gist_err,
+        "load_bot_state"   : load_bot_state().get("capital", "KEY_MISSING"),
+    })
+
+
 @app.route("/api/manual", methods=["GET"])
 def get_manual():
     return jsonify(load_manual())
