@@ -17,59 +17,75 @@ from flask import Flask, jsonify, request, send_from_directory, Response
 
 # ── 路徑 & 雲端設定 ─────────────────────────────────────────────
 BASE_DIR        = Path(__file__).parent
-BOT_STATE_FILE  = BASE_DIR / "ema99_bot_state.json"
-MANUAL_FILE     = BASE_DIR / "portfolio_manual.json"
+EQUITY_DAILY_FILE    = BASE_DIR / "equity_daily.json"   # 每日 08:00 資金快照
+INITIAL_CAPITAL      = 10_000.0                          # 觀察期起始資金
+BOT_STATE_FILE       = BASE_DIR / "ema99_bot_state.json"
+NFES_STATE_FILE      = BASE_DIR / "nfes_bot_state.json"
+MANUAL_FILE          = BASE_DIR / "portfolio_manual.json"
+SAM_TRADES_FILE      = BASE_DIR / "brain" / "sams_brain_trades.json"
+SAM_STATE_FILE       = BASE_DIR / "brain" / "sams_brain_state.json"
 
-# JSONBin — 讓 Render 雲端也能讀到 bot 狀態
-JSONBIN_API_KEY = os.getenv("JSONBIN_API_KEY", "")
-JSONBIN_BIN_ID  = os.getenv("JSONBIN_BIN_ID",  "")
-# 手動持倉存在第二個 bin（可選，沒設就存本機 JSON）
-JSONBIN_MANUAL_BIN_ID = os.getenv("JSONBIN_MANUAL_BIN_ID", "")
+# GitHub Gist — 讓 Render 雲端也能讀到 bot 狀態
+GITHUB_TOKEN   = os.getenv("GITHUB_TOKEN", "")
+GIST_ID        = os.getenv("GIST_ID",      "627811c22b1d404fdcbb6115f81fd1e7")
+GIST_FILENAME  = "portfolio_state.json"
 
 app = Flask(__name__, static_folder=str(BASE_DIR))
 
 # ─────────────────────────────────────────────────────────────────
-# JSONBin 工具
+# GitHub Gist 工具
 # ─────────────────────────────────────────────────────────────────
-_jb_cache: dict = {}
-_jb_cache_ts: float = 0.0
+_gist_cache: dict = {}
+_gist_cache_ts: float = 0.0
 
-def _jsonbin_get(bin_id: str) -> dict | None:
-    """讀取 JSONBin，cache 20 秒避免過度請求"""
-    global _jb_cache, _jb_cache_ts
-    cache_key = bin_id
+def _gist_get() -> dict | None:
+    """從 GitHub Gist 讀取 portfolio 狀態，cache 30 秒"""
+    global _gist_cache, _gist_cache_ts
     now = time.time()
-    if cache_key in _jb_cache and now - _jb_cache_ts < 20:
-        return _jb_cache[cache_key]
+    if _gist_cache and now - _gist_cache_ts < 30:
+        return _gist_cache
     try:
         r = _requests.get(
-            f"https://api.jsonbin.io/v3/b/{bin_id}/latest",
-            headers={"X-Master-Key": JSONBIN_API_KEY},
+            f"https://api.github.com/gists/{GIST_ID}",
+            headers={"Authorization": f"token {GITHUB_TOKEN}",
+                     "Accept": "application/vnd.github+json"},
             timeout=8,
         )
         if r.ok:
-            data = r.json().get("record", {})
-            _jb_cache[cache_key] = data
-            _jb_cache_ts = now
+            raw = r.json()["files"][GIST_FILENAME]["content"]
+            data = json.loads(raw)
+            _gist_cache.update(data)
+            _gist_cache_ts = now
             return data
     except Exception:
         pass
     return None
 
-def _jsonbin_put(bin_id: str, data: dict) -> bool:
+def _gist_put(data: dict) -> bool:
+    """把 portfolio 狀態寫入 GitHub Gist"""
     try:
-        r = _requests.put(
-            f"https://api.jsonbin.io/v3/b/{bin_id}",
-            headers={"X-Master-Key": JSONBIN_API_KEY,
+        r = _requests.patch(
+            f"https://api.github.com/gists/{GIST_ID}",
+            headers={"Authorization": f"token {GITHUB_TOKEN}",
+                     "Accept": "application/vnd.github+json",
                      "Content-Type": "application/json"},
-            json=data, timeout=8,
+            json={"files": {GIST_FILENAME: {"content": json.dumps(data, ensure_ascii=False)}}},
+            timeout=8,
         )
         if r.ok:
-            _jb_cache[bin_id] = data
-            _jb_cache_ts = time.time()
+            _gist_cache.update(data)
+            _gist_cache_ts = time.time()
         return r.ok
     except Exception:
         return False
+
+# JSONBin 保留空殼（相容舊 env vars，不再使用）
+JSONBIN_API_KEY = ""
+JSONBIN_BIN_ID = ""
+JSONBIN_NFES_BIN_ID = ""
+JSONBIN_MANUAL_BIN_ID = ""
+def _jsonbin_get(bin_id): return None
+def _jsonbin_put(bin_id, data): return False
 
 # ─────────────────────────────────────────────────────────────────
 # 手動持倉（本機 JSON 或 JSONBin）
@@ -91,8 +107,12 @@ def save_manual(data: dict):
         _jsonbin_put(JSONBIN_MANUAL_BIN_ID, data)
 
 def fmt_sym(sym: str) -> str:
-    """把 'BTC/USDT:USDT' 變成 'BTC'"""
-    return sym.split("/")[0]
+    """把 'BTC/USDT:USDT' 或 'BTCUSDT' 變成 'BTC'"""
+    base = sym.split("/")[0]          # ccxt: 'BTC/USDT:USDT' → 'BTC'
+    # 若已是 'BTCUSDT' 格式，去掉尾部 USDT
+    if "/" not in sym and base.endswith("USDT"):
+        base = base[:-4]
+    return base
 
 _live_price_cache: dict = {}
 _live_price_ts: float = 0.0
@@ -113,38 +133,86 @@ def get_live_prices() -> dict[str, float]:
     return _live_price_cache
 
 def to_binance_sym(ccxt_sym: str) -> str:
-    """'1000PEPE/USDT:USDT' → '1000PEPEUSDT'"""
+    """'1000PEPE/USDT:USDT' → '1000PEPEUSDT'；'PLAYUSDT' → 'PLAYUSDT'（已是正確格式）"""
+    if "/" not in ccxt_sym:
+        # NFES bot 已存為 'PLAYUSDT' 格式，直接回傳
+        return ccxt_sym if ccxt_sym.endswith("USDT") else ccxt_sym + "USDT"
     base = ccxt_sym.split("/")[0]
     return base + "USDT"
+
 
 # ─────────────────────────────────────────────────────────────────
 # API 路由
 # ─────────────────────────────────────────────────────────────────
 
 def load_bot_state() -> dict:
-    """優先從 JSONBin 讀（雲端 Render 用），否則讀本機 JSON"""
-    if JSONBIN_API_KEY and JSONBIN_BIN_ID:
-        data = _jsonbin_get(JSONBIN_BIN_ID)
-        if data:
-            return data
+    """優先讀本機 JSON（本機模式），否則從 Gist 讀（Render 雲端模式）"""
     if BOT_STATE_FILE.exists():
         return json.loads(BOT_STATE_FILE.read_text())
+    # 雲端 Render：從 Gist 讀完整 portfolio 快照
+    if GITHUB_TOKEN and GIST_ID:
+        data = _gist_get()
+        if data:
+            return data
     return {}
 
-@app.route("/api/crypto")
-def api_crypto():
-    """讀取 bot state（本機或 JSONBin），回傳加密幣持倉"""
-    state = load_bot_state()
-    if not state:
-        return jsonify({"positions": [], "capital": 0, "trades": [], "source": "none"})
-    positions = state.get("positions", {})
-    trades    = state.get("trades", [])
-    capital   = state.get("capital", 0)
-    last_run  = state.get("last_run", "")
+def load_nfes_state() -> dict:
+    """讀取 NFES bot 狀態（本機 JSON）"""
+    if NFES_STATE_FILE.exists():
+        return json.loads(NFES_STATE_FILE.read_text())
+    return {}
 
-    # 取得即時價格
-    live_prices = get_live_prices()
+def _record_daily_equity(capital: float) -> None:
+    """每天 08:00 記錄一次資金快照（台灣時間 = UTC+8）"""
+    from datetime import timedelta
+    now_tw = datetime.now(timezone.utc) + timedelta(hours=8)
+    today  = now_tw.strftime("%Y-%m-%d")
+    hour   = now_tw.hour
 
+    # 讀取現有快照
+    if EQUITY_DAILY_FILE.exists():
+        snapshots: dict = json.loads(EQUITY_DAILY_FILE.read_text())
+    else:
+        snapshots = {"start": INITIAL_CAPITAL, "daily": {}}
+
+    # 08:00~08:59 且今天還沒記錄 → 寫入
+    if hour == 8 and today not in snapshots.get("daily", {}):
+        snapshots.setdefault("daily", {})[today] = round(capital, 2)
+        EQUITY_DAILY_FILE.write_text(json.dumps(snapshots, ensure_ascii=False, indent=2))
+
+    # 確保有起始點（第一次執行時補上）
+    if not snapshots.get("daily"):
+        snapshots["daily"]["2026-05-19"] = INITIAL_CAPITAL  # 觀察期第一天
+        EQUITY_DAILY_FILE.write_text(json.dumps(snapshots, ensure_ascii=False, indent=2))
+
+
+def _get_equity_curve(capital: float) -> list:
+    """回傳 [{date, capital}] 的資產曲線，最後一筆補上當前資金"""
+    if EQUITY_DAILY_FILE.exists():
+        snapshots = json.loads(EQUITY_DAILY_FILE.read_text())
+    else:
+        snapshots = {"start": INITIAL_CAPITAL, "daily": {}}
+
+    daily = snapshots.get("daily", {})
+    # 排序日期
+    points = sorted(daily.items())
+    # 確保有起始點
+    if not points or points[0][0] > "2026-05-19":
+        points.insert(0, ("2026-05-19", INITIAL_CAPITAL))
+    # 加上今天的即時資金
+    from datetime import timedelta
+    today = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d")
+    if not points or points[-1][0] < today:
+        points.append((today, round(capital, 2)))
+    else:
+        # 今天已有快照，更新成即時資金
+        points[-1] = (today, round(capital, 2))
+
+    return [{"date": d, "capital": c} for d, c in points]
+
+
+def _build_positions(positions: dict, strategy: str, live_prices: dict) -> list:
+    """將 bot state positions dict 轉換為前端用的 list（含策略標籤）"""
     result = []
     for sym, p in positions.items():
         entry    = p.get("entry_px", 0)
@@ -154,23 +222,32 @@ def api_crypto():
         notional = p.get("notional", margin)
         partial  = p.get("partial", False)
         entry_ts = p.get("entry_ts", "")
+        side     = p.get("side", "long")
 
-        # 即時價 > 存檔價，優先用即時
         bsym      = to_binance_sym(sym)
         live_cur  = live_prices.get(bsym)
         cur       = live_cur if live_cur else p.get("cur_px", entry)
         using_live = live_cur is not None
 
-        pnl_pct = (cur - entry) / entry * 100 if entry else 0
-        pnl_usd = (cur - entry) * p.get("qty", 0)
-        sl_triggered = cur < sl  # 即時價跌破止損
+        if entry:
+            pnl_pct = (cur - entry) / entry * 100 * (1 if side == "long" else -1)
+            pnl_usd = (cur - entry) * p.get("qty", 0) * (1 if side == "long" else -1)
+        else:
+            pnl_pct = pnl_usd = 0
+
+        sl_triggered = (cur < sl) if side == "long" else (cur > sl)
 
         result.append({
             "sym"         : fmt_sym(sym),
             "full_sym"    : sym,
+            "strategy"    : strategy,
+            "side"        : side,
             "entry_px"    : round(entry, 8),
             "cur_px"      : round(cur, 8),
             "sl"          : round(sl, 8),
+            "tp1"         : round(p.get("tp1", 0), 8),
+            "tp2"         : round(p.get("tp2", 0), 8),
+            "tp3"         : round(p.get("tp3", 0), 8),
             "margin"      : round(margin, 2),
             "notional"    : round(notional, 2),
             "lev"         : lev,
@@ -181,18 +258,70 @@ def api_crypto():
             "using_live"  : using_live,
             "sl_triggered": sl_triggered,
         })
+    return result
 
-    # 近期交易（最新 10 筆）
-    recent = sorted(trades, key=lambda x: x.get("exit_ts",""), reverse=True)[:10]
-    for t in recent:
-        t["sym"] = fmt_sym(t.get("sym",""))
+
+@app.route("/api/crypto")
+def api_crypto():
+    """讀取雙策略 bot state，回傳合併加密幣持倉（共用資金）"""
+    ema_state  = load_bot_state()
+    nfes_state = load_nfes_state()
+    live_prices = get_live_prices()
+
+    # ── EMA99 持倉 ────────────────────────────────────────────
+    ema_positions = _build_positions(
+        ema_state.get("positions", {}),
+        strategy  = "EMA99",
+        live_prices = live_prices,
+    )
+    ema_trades  = ema_state.get("trades", [])
+    ema_capital = ema_state.get("capital", 0)
+    ema_last    = ema_state.get("last_run", "")
+
+    # ── NFES 持倉 ─────────────────────────────────────────────
+    nfes_positions = _build_positions(
+        nfes_state.get("positions", {}),
+        strategy  = nfes_state.get("strategy", "NFES 強化版"),
+        live_prices = live_prices,
+    )
+    nfes_trades = nfes_state.get("trades", [])
+    nfes_last   = nfes_state.get("last_run", "")
+
+    # ── 合併（共用同一個 Binance 帳號資金）────────────────────
+    # capital = EMA99 state 裡的本金（兩策略共用同一帳號，不重複加）
+    all_positions = ema_positions + nfes_positions
+
+    # 合併 trades，標記策略名稱，最新 20 筆
+    all_trades = []
+    for t in ema_trades:
+        tc = dict(t)
+        tc["sym"]      = fmt_sym(tc.get("sym", ""))
+        tc["strategy"] = tc.get("strategy", "EMA99")
+        all_trades.append(tc)
+    for t in nfes_trades:
+        tc = dict(t)
+        tc["sym"]      = fmt_sym(tc.get("sym", ""))
+        tc["strategy"] = tc.get("strategy", "NFES 強化版")
+        all_trades.append(tc)
+    recent = sorted(all_trades, key=lambda x: x.get("exit_ts", ""))
+
+    # last_run = 兩者取較新的
+    last_run = max(ema_last, nfes_last) if ema_last and nfes_last else (ema_last or nfes_last)
 
     source = "jsonbin" if (JSONBIN_API_KEY and JSONBIN_BIN_ID) else "local"
+    # 每日 08:00 記錄快照
+    _record_daily_equity(ema_capital)
+    # 資產曲線（每日快照）
+    equity_curve = _get_equity_curve(ema_capital)
+    # 總損益 = 現在資金 - 起始資金
+    total_pnl = round(ema_capital - INITIAL_CAPITAL, 2)
     return jsonify({
-        "positions"    : result,
-        "capital"      : round(capital, 2),
+        "positions"    : all_positions,
+        "capital"      : round(ema_capital, 2),
         "last_run"     : last_run,
         "recent_trades": recent,
+        "equity_curve" : equity_curve,   # [{date, capital}] 每日資金快照
+        "total_pnl"    : total_pnl,      # 真實總損益
         "source"       : source,
     })
 
@@ -261,6 +390,156 @@ def delete_manual(pos_id):
 
 
 # ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
+# sam 思考視覺化頁面
+# ─────────────────────────────────────────────────────────────────
+SAM_THINKING_HTML = r"""<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🧠 sam 的思考</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0d1117; color: #e6edf3; font-family: -apple-system, sans-serif; padding: 16px; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .sub { color: #8b949e; font-size: 13px; margin-bottom: 20px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 16px; margin-bottom: 14px; }
+  .card.approved { border-left: 4px solid #3fb950; }
+  .card.rejected { border-left: 4px solid #8b949e; }
+  .card.long  { border-left: 4px solid #3fb950; }
+  .card.short { border-left: 4px solid #f85149; }
+  .sym { font-size: 18px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+  .badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; font-weight: 600; }
+  .badge.long  { background: #1a3a26; color: #3fb950; }
+  .badge.short { background: #3a1a1a; color: #f85149; }
+  .badge.skip  { background: #2a2a2a; color: #8b949e; }
+  .ts { color: #8b949e; font-size: 12px; margin-top: 2px; margin-bottom: 12px; }
+  .section { margin-bottom: 10px; }
+  .section-title { font-size: 11px; font-weight: 600; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+  .market-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+  .market-item { background: #0d1117; border-radius: 6px; padding: 6px 8px; }
+  .market-item .label { font-size: 10px; color: #8b949e; }
+  .market-item .value { font-size: 13px; font-weight: 600; }
+  .trend-bull { color: #3fb950; }
+  .trend-bear { color: #f85149; }
+  .trend-neutral { color: #d29922; }
+  .thinking-text { font-size: 13px; line-height: 1.7; color: #c9d1d9; background: #0d1117; border-radius: 8px; padding: 10px 12px; white-space: pre-wrap; }
+  .decision-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
+  .score-bar { flex: 1; min-width: 120px; }
+  .score-label { font-size: 11px; color: #8b949e; margin-bottom: 3px; }
+  .bar-bg { background: #21262d; border-radius: 4px; height: 8px; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 4px; transition: width 0.6s ease; }
+  .lev-badge { background: #1c2a3a; color: #58a6ff; border-radius: 6px; padding: 3px 10px; font-size: 13px; font-weight: 700; }
+  .reason { font-size: 13px; color: #c9d1d9; font-style: italic; margin-top: 8px; }
+  .stats-bar { display: flex; gap: 12px; background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 12px 16px; margin-bottom: 16px; flex-wrap: wrap; }
+  .stat { text-align: center; }
+  .stat .n { font-size: 20px; font-weight: 700; }
+  .stat .l { font-size: 11px; color: #8b949e; }
+  .refresh-btn { position: fixed; bottom: 20px; right: 20px; background: #238636; color: #fff; border: none; border-radius: 50%; width: 48px; height: 48px; font-size: 22px; cursor: pointer; box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
+  .empty { text-align: center; color: #8b949e; padding: 40px; }
+  .flow { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; font-size: 12px; color: #8b949e; flex-wrap: wrap; }
+  .flow-step { background: #21262d; border-radius: 6px; padding: 3px 8px; }
+  .flow-arrow { color: #30363d; }
+</style>
+</head>
+<body>
+<h1>🧠 sam 的思考過程</h1>
+<p class="sub">每一筆都是我自己的判斷，沒有固定公式</p>
+
+<div class="stats-bar" id="stats-bar">
+  <div class="stat"><div class="n" id="stat-total">-</div><div class="l">掃描</div></div>
+  <div class="stat"><div class="n" id="stat-approved" style="color:#3fb950">-</div><div class="l">進場</div></div>
+  <div class="stat"><div class="n" id="stat-equity" style="color:#58a6ff">-</div><div class="l">資金(U)</div></div>
+  <div class="stat"><div class="n" id="stat-trades">-</div><div class="l">完成交易</div></div>
+  <div class="stat"><div class="n" id="stat-positions">-</div><div class="l">持倉中</div></div>
+</div>
+
+<div class="flow">
+  <span class="flow-step">📡 市場掃描</span>
+  <span class="flow-arrow">→</span>
+  <span class="flow-step">🔍 結構分析</span>
+  <span class="flow-arrow">→</span>
+  <span class="flow-step">💭 自由判斷</span>
+  <span class="flow-arrow">→</span>
+  <span class="flow-step">⚡ 決策輸出</span>
+</div>
+
+<div id="list"><div class="empty">載入中...</div></div>
+<button class="refresh-btn" onclick="load()">↻</button>
+
+<script>
+async function load() {
+  const r = await fetch('/api/sam/thinking');
+  const d = await r.json();
+  const logs = d.thinking || [];
+  const state = d.state || {};
+
+  document.getElementById('stat-total').textContent = logs.length;
+  document.getElementById('stat-approved').textContent = logs.filter(l=>l.approved).length;
+  document.getElementById('stat-equity').textContent = (state.equity||1000).toFixed(0);
+  document.getElementById('stat-trades').textContent = state.total_trades || 0;
+  document.getElementById('stat-positions').textContent = Object.keys(state.positions||{}).length;
+
+  const el = document.getElementById('list');
+  if (!logs.length) { el.innerHTML = '<div class="empty">還沒有思考記錄，sam 正在掃描中...</div>'; return; }
+
+  el.innerHTML = logs.map(log => {
+    const approved = log.approved;
+    const side = log.side || '';
+    const score = log.score || 0;
+    const lev = log.leverage || 1;
+    const m = log.market || {};
+    const trend = m.trend || 'neutral';
+    const trendLabel = trend==='bull' ? '<span class="trend-bull">📈 多頭</span>' : trend==='bear' ? '<span class="trend-bear">📉 空頭</span>' : '<span class="trend-neutral">➡️ 中性</span>';
+    const ts = (log.timestamp||'').substring(0,16).replace('T',' ');
+    const barColor = score>=70?'#3fb950':score>=55?'#d29922':'#8b949e';
+    const sideClass = !approved?'skip':side==='long'?'long':'short';
+    const sideLabel = !approved?'跳過':side==='long'?'做多':'做空';
+    const levStars = '⚡'.repeat(lev);
+
+    return `<div class="card ${sideClass}">
+      <div class="sym">
+        ${log.symbol||'?'}
+        <span class="badge ${sideClass}">${sideLabel}</span>
+        ${approved ? '<span class="lev-badge">'+levStars+' '+lev+'x</span>' : ''}
+      </div>
+      <div class="ts">${ts}</div>
+
+      <div class="section">
+        <div class="section-title">📊 我看到的市場</div>
+        <div class="market-grid">
+          <div class="market-item"><div class="label">趨勢</div><div class="value">${trendLabel}</div></div>
+          <div class="market-item"><div class="label">ATR%</div><div class="value">${((m.atr_pct||0)*100).toFixed(2)}%</div></div>
+          <div class="market-item"><div class="label">量比</div><div class="value">${(m.vol_ratio||0).toFixed(1)}x</div></div>
+          <div class="market-item"><div class="label">EMA99</div><div class="value">${(m.ema99||0).toFixed(4)}</div></div>
+          <div class="market-item"><div class="label">EMA200</div><div class="value">${(m.ema200||0).toFixed(4)}</div></div>
+          <div class="market-item"><div class="label">現價</div><div class="value">${(m.price||0).toFixed(4)}</div></div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">💭 我的判斷</div>
+        <div class="thinking-text">${(log.brain_view||'（無）').substring(0,400)}${(log.brain_view||'').length>400?'...':''}</div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">⚡ 我的決策</div>
+        <div class="score-bar">
+          <div class="score-label">信心 ${score}/100</div>
+          <div class="bar-bg"><div class="bar-fill" style="width:${score}%;background:${barColor}"></div></div>
+        </div>
+        <div class="reason">${log.reason||''}</div>
+      </div>
+    </div>`;
+  }).join('');
+}
+load();
+setInterval(load, 60000);
+</script>
+</body>
+</html>"""
+
 # 前端 HTML（PWA）
 # ─────────────────────────────────────────────────────────────────
 
@@ -310,6 +589,12 @@ HTML = r"""<!DOCTYPE html>
   .tab { flex-shrink: 0; padding: 7px 16px; border-radius: 20px; font-size: 14px; font-weight: 500;
          background: var(--card2); color: var(--sub); border: none; cursor: pointer; transition: all .2s; }
   .tab.active { background: var(--blue); color: #fff; }
+
+  /* ── Strategy Badge ── */
+  .strategy-tag { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 6px;
+                  margin-right: 6px; letter-spacing: .3px; }
+  .strat-ema99  { background: rgba(10,132,255,.2); color: var(--blue); }
+  .strat-nfes   { background: rgba(191,90,242,.25); color: var(--purple); }
 
   /* ── Section ── */
   .section { padding: 0 20px; margin-bottom: 28px; }
@@ -367,6 +652,21 @@ HTML = r"""<!DOCTYPE html>
                 border-radius: 10px; padding: 10px 14px; margin-bottom: 8px;
                 font-size: 13px; color: var(--red); display: flex; align-items: center; gap: 8px; }
 
+  /* ── Pull-to-Refresh ── */
+  .ptr-indicator {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 200;
+    display: flex; align-items: center; justify-content: center;
+    height: 0; overflow: hidden; background: var(--card);
+    font-size: 13px; color: var(--sub); transition: height .2s;
+    border-bottom: 1px solid var(--sep);
+  }
+  .ptr-indicator.visible { height: 44px; }
+  .ptr-indicator.refreshing { color: var(--blue); }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .ptr-spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--blue);
+                 border-top-color: transparent; border-radius: 50%; animation: spin .6s linear infinite;
+                 margin-right: 6px; }
+
   /* ── Delete swipe hint ── */
   .pos-card-wrap { position: relative; }
   .pos-del-btn { position: absolute; right: 0; top: 0; bottom: 0; width: 70px; background: var(--red);
@@ -382,13 +682,41 @@ HTML = r"""<!DOCTYPE html>
   .trade-reason { font-size: 12px; color: var(--sub); margin-top: 2px; }
   .trade-pnl { text-align: right; font-size: 15px; font-weight: 600; }
   .trade-ts { font-size: 11px; color: var(--sub); margin-top: 2px; }
+
+  /* ── Trade Filter ── */
+  .trade-filter { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; align-items: center; }
+  .filter-btn { background: var(--card2); border: none; color: var(--sub); padding: 6px 14px;
+                border-radius: 20px; font-size: 13px; cursor: pointer; transition: all .2s; }
+  .filter-btn.active { background: var(--blue); color: #fff; }
+  .filter-custom { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .filter-custom input[type=date] { background: var(--card2); border: none; color: var(--text);
+    padding: 5px 10px; border-radius: 10px; font-size: 13px; }
+  .filter-custom button { background: var(--card2); border: none; color: var(--blue);
+    padding: 5px 12px; border-radius: 10px; font-size: 13px; cursor: pointer; }
+
+  /* ── Trade Stats Bar ── */
+  .trade-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 14px; }
+  .ts-card { background: var(--card2); border-radius: 12px; padding: 10px; text-align: center; }
+  .ts-card .ts-label { font-size: 10px; color: var(--sub); margin-bottom: 3px; }
+  .ts-card .ts-val { font-size: 15px; font-weight: 700; }
+
+  /* ── Equity Chart ── */
+  .equity-wrap { background: var(--card); border-radius: var(--radius); padding: 16px; margin-bottom: 14px; }
+  .equity-title { font-size: 13px; color: var(--sub); margin-bottom: 10px; }
+  .equity-wrap canvas { width: 100% !important; }
+
 </style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
 <body>
 
+<div class="ptr-indicator" id="ptr-indicator">
+  <span id="ptr-text">↓ 下拉更新</span>
+</div>
+
 <div class="header">
   <h1>📊 投資組合</h1>
-  <button class="refresh-btn" onclick="loadAll()">↻ 更新</button>
+  <button class="refresh-btn" id="refresh-btn" onclick="loadAll()">↻ 更新</button>
 </div>
 
 <!-- 總覽 -->
@@ -411,6 +739,8 @@ HTML = r"""<!DOCTYPE html>
 <div class="tabs">
   <button class="tab active" onclick="switchTab('all', this)">全部</button>
   <button class="tab" onclick="switchTab('CRYPTO', this)">🔷 加密</button>
+  <button class="tab" onclick="switchTab('EMA99', this)">📈 EMA99</button>
+  <button class="tab" onclick="switchTab('NFES', this)">🔮 NFES強化版</button>
   <button class="tab" onclick="switchTab('TW', this)">🇹🇼 台股</button>
   <button class="tab" onclick="switchTab('US', this)">🇺🇸 美股</button>
   <button class="tab" onclick="switchTab('ETF', this)">📦 ETF</button>
@@ -448,11 +778,20 @@ HTML = r"""<!DOCTYPE html>
 
 <script>
 let currentTab = 'all';
-let cryptoData  = { positions: [], capital: 0, recent_trades: [] };
+let cryptoData  = { positions: [], capital: 0, recent_trades: [], trade_pnl_sum: 0, pnl_offset: 0 };
 let manualData  = { positions: [] };
 let editingId   = null;
 
+let _loading = false;
 async function loadAll() {
+  if (_loading) return;
+  _loading = true;
+  const btn = document.getElementById('refresh-btn');
+  const ptr = document.getElementById('ptr-indicator');
+  const ptrText = document.getElementById('ptr-text');
+  if (btn) { btn.disabled = true; btn.textContent = '更新中...'; }
+  if (ptr) { ptr.classList.add('visible','refreshing');
+             ptrText.innerHTML = '<span class="ptr-spinner"></span>更新中...'; }
   try {
     const [cr, mn] = await Promise.all([
       fetch('/api/crypto').then(r => r.json()),
@@ -464,6 +803,13 @@ async function loadAll() {
     renderTab(currentTab);
   } catch(e) {
     console.error(e);
+  } finally {
+    _loading = false;
+    if (btn) { btn.disabled = false; btn.textContent = '↻ 更新'; }
+    if (ptr) {
+      ptrText.textContent = '↓ 下拉更新';
+      ptr.classList.remove('visible','refreshing');
+    }
   }
 }
 
@@ -495,15 +841,25 @@ function switchTab(tab, el) {
 
 function renderTab(tab) {
   const el = document.getElementById('main-content');
-  if (tab === 'trades') { el.innerHTML = renderTrades(); return; }
+  if (tab === 'trades') {
+    el.innerHTML = '<div id="tab-content"></div>';
+    renderTrades();
+    return;
+  }
 
   let html = '';
 
-  // 加密幣區塊
-  if (tab === 'all' || tab === 'CRYPTO') {
-    const positions = cryptoData.positions;
+  // 加密幣區塊（可按策略篩選）
+  if (tab === 'all' || tab === 'CRYPTO' || tab === 'EMA99' || tab === 'NFES') {
+    let positions = cryptoData.positions;
+    if (tab === 'EMA99') positions = positions.filter(p => p.strategy === 'EMA99');
+    if (tab === 'NFES')  positions = positions.filter(p => p.strategy && p.strategy.includes('NFES'));
+
+    const sectionTitle = tab === 'EMA99'  ? '📈 EMA99 持倉'
+                       : tab === 'NFES'   ? '🔮 NFES 強化版持倉'
+                       : '🔷 加密幣持倉';
     html += `<div class="section">
-      <div class="section-title"><span>🔷 加密幣持倉</span></div>`;
+      <div class="section-title"><span>${sectionTitle}</span></div>`;
     if (!positions.length) {
       html += `<div class="empty"><div class="icon">📭</div><div>目前無持倉</div></div>`;
     } else {
@@ -542,16 +898,58 @@ function renderTab(tab) {
   el.innerHTML = html;
 }
 
+function strategyTag(strategy) {
+  if (!strategy) return '';
+  const cls = strategy.includes('NFES') ? 'strat-nfes' : 'strat-ema99';
+  return `<span class="strategy-tag ${cls}">${strategy}</span>`;
+}
+
+function fmtEntryTs(ts) {
+  if (!ts) return '';
+  try {
+    const d = new Date(ts);
+    const MM = String(d.getMonth()+1).padStart(2,'0');
+    const DD = String(d.getDate()).padStart(2,'0');
+    const hh = String(d.getHours()).padStart(2,'0');
+    const mm = String(d.getMinutes()).padStart(2,'0');
+    return `${d.getFullYear()}/${MM}/${DD} ${hh}:${mm}`;
+  } catch(e) { return ''; }
+}
+
 function renderCryptoCard(p) {
   const pnlColor   = p.pnl_pct >= 0 ? 'green' : 'red';
   const pnlSign    = p.pnl_pct >= 0 ? '▲' : '▼';
+  const isLong     = (p.side || 'long') === 'long';
   const slPct      = p.entry_px ? ((p.sl - p.entry_px) / p.entry_px * 100).toFixed(1) : 0;
   const liveTag    = p.using_live ? '🟢 即時' : '🟡 存檔';
   const cardBorder = p.sl_triggered ? 'border:1px solid rgba(255,69,58,.5);' : '';
+  const dirLabel   = isLong ? '<span style="color:var(--green)">▲ LONG</span>' : '<span style="color:var(--red)">▼ SHORT</span>';
+  const entryTimeStr = fmtEntryTs(p.entry_ts);
+  // TP 目標（NFES 才有 tp1/tp2/tp3）
+  // 做多：價格漲才獲利 ↑ 綠；做空：價格跌才獲利 ↓ 紅
+  const tpColor  = isLong ? 'var(--green)' : 'var(--red)';
+  const tpArrow  = isLong ? '↑' : '↓';
+  const tpTitle  = isLong ? '🎯 做多止盈' : '🎯 做空止盈';
+  function tpPct(tp) {
+    if (!p.entry_px || !tp) return '';
+    const pct = isLong
+      ? ((tp - p.entry_px) / p.entry_px * 100).toFixed(1)
+      : ((p.entry_px - tp) / p.entry_px * 100).toFixed(1);
+    return ` <span style="font-size:11px;color:var(--sub)">(+${pct}%)</span>`;
+  }
+  const tpHtml = (p.tp1 && p.tp1 > 0) ? `
+    <div class="divider"></div>
+    <div style="font-size:11px;color:var(--sub);margin-bottom:6px">${tpTitle} ${tpArrow}</div>
+    <div class="pos-row">
+      <div class="pos-item"><span class="lbl">TP1</span><span class="val" style="color:${tpColor}">${tpArrow} ${fmtPx(p.tp1)}${tpPct(p.tp1)}</span></div>
+      <div class="pos-item" style="text-align:center"><span class="lbl">TP2</span><span class="val" style="color:${tpColor}">${tpArrow} ${fmtPx(p.tp2)}${tpPct(p.tp2)}</span></div>
+      <div class="pos-item" style="text-align:right"><span class="lbl">TP3</span><span class="val" style="color:${tpColor}">${tpArrow} ${fmtPx(p.tp3)}${tpPct(p.tp3)}</span></div>
+    </div>` : '';
+
   return `<div class="pos-card" style="${cardBorder}">
     <div class="pos-top">
-      <div class="pos-sym">${p.sym} ${p.sl_triggered ? '⚠️' : ''}</div>
-      <span class="pos-badge badge-crypto">加密 ${p.lev}×</span>
+      <div class="pos-sym">${strategyTag(p.strategy)}${p.sym}${entryTimeStr ? ` <span style="font-size:12px;font-weight:400;color:var(--sub)">(${entryTimeStr})</span>` : ''} ${p.sl_triggered ? '⚠️' : ''}</div>
+      <span class="pos-badge badge-crypto">${dirLabel} ${p.lev}×</span>
     </div>
     <div class="pos-row">
       <div class="pos-item">
@@ -578,6 +976,7 @@ function renderCryptoCard(p) {
         <span class="val">$${fmt(p.margin)}</span>
       </div>
     </div>
+    ${tpHtml}
     <div class="pos-footer">
       ${p.partial ? '<span class="tag partial">50% 已出場</span>' : ''}
       ${p.sl_triggered ? '<span class="tag" style="background:rgba(255,69,58,.2);color:var(--red)">⚠️ 止損觸發</span>' : ''}
@@ -637,23 +1036,194 @@ function renderManualCard(p, market) {
   </div>`;
 }
 
-function renderTrades() {
-  const trades = cryptoData.recent_trades || [];
-  let html = `<div class="section"><div class="section-title">📋 近期交易（加密）</div>`;
-  if (!trades.length) {
-    html += `<div class="empty"><div class="icon">📭</div><div>尚無交易記錄</div></div>`;
+// ── Trade filter state ─────────────────────────────────────────
+let _tradeRange = '30';   // '7' | '30' | 'custom'
+let _tradeFrom  = '';
+let _tradeTo    = '';
+let _equityChart = null;
+
+function _filterTrades(trades) {
+  const now = Date.now();
+  let from, to;
+  if (_tradeRange === '7')  { from = now - 7  * 86400000; to = now; }
+  if (_tradeRange === '30') { from = now - 30 * 86400000; to = now; }
+  if (_tradeRange === 'custom') {
+    from = _tradeFrom ? new Date(_tradeFrom).getTime() : 0;
+    to   = _tradeTo   ? new Date(_tradeTo).getTime() + 86400000 : now;
+  }
+  return trades.filter(t => {
+    const ts = t.exit_ts ? new Date(t.exit_ts).getTime() : 0;
+    return ts >= from && ts <= to;
+  });
+}
+
+function _setRange(r) {
+  _tradeRange = r;
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  const btn = document.getElementById('fb-' + r);
+  if (btn) btn.classList.add('active');
+  document.getElementById('custom-range').style.display = r === 'custom' ? 'flex' : 'none';
+  renderTrades();
+}
+
+function _applyCustomRange() {
+  _tradeFrom = document.getElementById('trade-from').value;
+  _tradeTo   = document.getElementById('trade-to').value;
+  renderTrades();
+}
+
+function _drawEquity(trades) {
+  const INIT = 10000;
+  // 優先用每日快照曲線
+  const curve = cryptoData.equity_curve || [];
+  const labels = [], data = [];
+  if (curve.length >= 2) {
+    curve.forEach(pt => {
+      labels.push(pt.date ? pt.date.slice(5) : '');  // MM-DD
+      data.push(pt.capital);
+    });
   } else {
-    html += `<div class="pos-card">`;
-    trades.forEach(t => {
+    // fallback：用 trades 累積（舊邏輯）
+    const sorted = [...trades].sort((a,b) => new Date(a.exit_ts||0) - new Date(b.exit_ts||0));
+    let cum = 0;
+    sorted.forEach(t => {
+      cum += (t.pnl || 0);
+      const d = t.exit_ts ? new Date(t.exit_ts).toLocaleDateString('zh-TW',{month:'2-digit',day:'2-digit'}) : '';
+      labels.push(d);
+      data.push(parseFloat((INIT + cum).toFixed(2)));
+    });
+    labels.unshift('起始'); data.unshift(INIT);
+  }
+
+  const ctx = document.getElementById('equity-canvas');
+  if (!ctx) return;
+  if (_equityChart) { _equityChart.destroy(); _equityChart = null; }
+
+  const lastVal = data[data.length - 1];
+  const lineColor = lastVal >= INIT ? '#30d158' : '#ff453a';
+  const fillColor = lastVal >= INIT ? 'rgba(48,209,88,.15)' : 'rgba(255,69,58,.15)';
+
+  _equityChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        data,
+        borderColor: lineColor,
+        backgroundColor: fillColor,
+        borderWidth: 2,
+        pointRadius: data.length <= 20 ? 3 : 0,
+        pointHoverRadius: 5,
+        fill: true,
+        tension: 0.3,
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: ctx => {
+              const diff = ctx.parsed.y - INIT;
+              return `${ctx.parsed.y.toFixed(0)} U  (${diff >= 0 ? '+' : ''}${diff.toFixed(2)})`;
+            }
+          }
+        }
+      },
+      scales: {
+        x: { ticks: { color:'#8e8e93', font:{size:10}, maxTicksLimit:8 }, grid:{color:'rgba(255,255,255,.05)'} },
+        y: {
+          ticks: {
+            color:'#8e8e93', font:{size:10},
+            callback: v => v.toFixed(0) + ' U'
+          },
+          grid:{ color:'rgba(255,255,255,.05)' }
+        }
+      }
+    }
+  });
+}
+
+function renderTrades() {
+  const allTrades = (cryptoData.recent_trades || []).slice().reverse();  // 新→舊 for list
+  const filtered  = _filterTrades(allTrades);
+
+  // ── 統計 ───────────────────────────────────────────────────
+  const wins    = filtered.filter(t => t.pnl > 0);
+  const losses  = filtered.filter(t => t.pnl <= 0);
+  // 總損益：全期用真實值（capital-10000），篩選期間用 trades 加總
+  const isAllTime  = (_tradeRange === '30' && filtered.length === allTrades.length) || _tradeRange === 'all';
+  const totalPnl   = (_tradeRange === '30' && filtered.length >= allTrades.length)
+                     ? (cryptoData.total_pnl || 0)
+                     : filtered.reduce((s,t) => s + (t.pnl||0), 0);
+  const winRate = filtered.length ? (wins.length / filtered.length * 100) : 0;
+  const avgWin  = wins.length   ? wins.reduce((s,t) => s+t.pnl,0) / wins.length   : 0;
+  const avgLoss = losses.length ? losses.reduce((s,t) => s+t.pnl,0) / losses.length : 0;
+  const pnlCol  = totalPnl >= 0 ? 'var(--green)' : 'var(--red)';
+
+  let html = `<div class="section">
+  <div class="section-title">📋 交易紀錄</div>
+
+  <!-- 篩選器 -->
+  <div class="trade-filter">
+    <button class="filter-btn${_tradeRange==='7'?' active':''}"  id="fb-7"      onclick="_setRange('7')">7天</button>
+    <button class="filter-btn${_tradeRange==='30'?' active':''}" id="fb-30"     onclick="_setRange('30')">30天</button>
+    <button class="filter-btn${_tradeRange==='custom'?' active':''}" id="fb-custom" onclick="_setRange('custom')">自定義</button>
+    <div class="filter-custom" id="custom-range" style="display:${_tradeRange==='custom'?'flex':'none'}">
+      <input type="date" id="trade-from" value="${_tradeFrom}">
+      <span style="color:var(--sub)">～</span>
+      <input type="date" id="trade-to"   value="${_tradeTo}">
+      <button onclick="_applyCustomRange()">套用</button>
+    </div>
+  </div>
+
+  <!-- 統計 -->
+  <div class="trade-stats">
+    <div class="ts-card">
+      <div class="ts-label">總損益</div>
+      <div class="ts-val" style="color:${pnlCol}">${totalPnl>=0?'+':''}$${fmt(totalPnl)}</div>
+    </div>
+    <div class="ts-card">
+      <div class="ts-label">勝率</div>
+      <div class="ts-val">${winRate.toFixed(0)}%</div>
+    </div>
+    <div class="ts-card">
+      <div class="ts-label">均獲利</div>
+      <div class="ts-val" style="color:var(--green)">${avgWin>0?'+':''}$${fmt(avgWin)}</div>
+    </div>
+    <div class="ts-card">
+      <div class="ts-label">均虧損</div>
+      <div class="ts-val" style="color:var(--red)">${fmt(avgLoss)}</div>
+    </div>
+  </div>
+
+  <!-- 資產曲線 -->
+  <div class="equity-wrap">
+    <div class="equity-title">📈 資產曲線（每日 08:00 快照）起始 10,000U → 現在 ${(cryptoData.capital||10000).toFixed(0)}U</div>
+    <canvas id="equity-canvas" height="160"></canvas>
+  </div>
+
+  <!-- 交易列表 -->
+  <div class="pos-card">`;
+
+  if (!filtered.length) {
+    html += `<div class="empty"><div class="icon">📭</div><div>此區間無交易記錄</div></div>`;
+  } else {
+    filtered.forEach(t => {
       const sign = t.pnl >= 0 ? '+' : '';
       const col  = t.pnl >= 0 ? 'var(--green)' : 'var(--red)';
       const ts   = t.exit_ts ? new Date(t.exit_ts).toLocaleString('zh-TW', {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}) : '';
-      const reasonLabel = {
-        'partial_tp':'部分止盈', 'stop_loss':'止損', 'trail_stop':'移動止損', 'breakeven':'保本出場'
-      }[t.reason] || t.reason;
+      const reasonMap = {
+        'partial_tp':'部分止盈','tp1':'TP1 止盈','tp2':'TP2 止盈','tp3':'TP3 止盈',
+        'stop_loss':'止損','trail_stop':'移動止損','breakeven':'保本出場'
+      };
+      const reasonLabel = reasonMap[t.reason] || t.reason;
+      const stratCls = t.strategy && t.strategy.includes('NFES') ? 'strat-nfes' : 'strat-ema99';
+      const stratName = t.strategy || 'EMA99';
       html += `<div class="trade-row">
         <div>
-          <div class="trade-sym">${t.sym}</div>
+          <div class="trade-sym"><span class="strategy-tag ${stratCls}">${stratName}</span>${t.sym}</div>
           <div class="trade-reason">${reasonLabel}</div>
         </div>
         <div>
@@ -662,10 +1232,14 @@ function renderTrades() {
         </div>
       </div>`;
     });
-    html += `</div>`;
   }
-  html += `</div>`;
-  return html;
+  html += `</div></div>`;
+
+  // 注入 HTML 後繪圖
+  const el = document.getElementById('tab-content');
+  el.innerHTML = html;
+  _drawEquity(_filterTrades(cryptoData.recent_trades || []));
+  return '';  // renderTrades 由此直接操作 DOM
 }
 
 // ── Modal ──────────────────────────────────────────────────────
@@ -740,6 +1314,36 @@ document.getElementById('modal').addEventListener('click', e => {
   if (e.target === document.getElementById('modal')) closeModal();
 });
 
+// ── 下拉更新（Pull-to-Refresh）手勢 ──
+(function(){
+  let startY = 0, pulling = false;
+  const THRESHOLD = 70;
+  const ptr = document.getElementById('ptr-indicator');
+  const ptrText = document.getElementById('ptr-text');
+
+  document.addEventListener('touchstart', e => {
+    if (window.scrollY === 0) { startY = e.touches[0].clientY; pulling = true; }
+  }, { passive: true });
+
+  document.addEventListener('touchmove', e => {
+    if (!pulling) return;
+    const dy = e.touches[0].clientY - startY;
+    if (dy > 0 && dy < THRESHOLD + 20) {
+      ptr.classList.add('visible');
+      ptr.classList.remove('refreshing');
+      ptrText.textContent = dy > THRESHOLD ? '放開更新 ↑' : '↓ 繼續下拉';
+    }
+  }, { passive: true });
+
+  document.addEventListener('touchend', e => {
+    if (!pulling) return;
+    const dy = e.changedTouches[0].clientY - startY;
+    pulling = false;
+    if (dy > THRESHOLD) { loadAll(); }
+    else { ptr.classList.remove('visible'); ptrText.textContent = '↓ 下拉更新'; }
+  }, { passive: true });
+})();
+
 // 啟動
 loadAll();
 // 每 30 秒自動更新
@@ -747,6 +1351,29 @@ setInterval(loadAll, 30000);
 </script>
 </body>
 </html>"""
+
+@app.route("/api/sam/thinking")
+def api_sam_thinking():
+    """sam 最近的思考快照"""
+    thinking_file = Path(__file__).parent / "brain" / "sams_thinking_log.json"
+    sam_state_file = Path(__file__).parent / "brain" / "sams_brain_state.json"
+    logs = []
+    state = {}
+    if thinking_file.exists():
+        try:
+            logs = json.loads(thinking_file.read_text())
+        except Exception:
+            pass
+    if sam_state_file.exists():
+        try:
+            state = json.loads(sam_state_file.read_text())
+        except Exception:
+            pass
+    return jsonify({"thinking": list(reversed(logs[-20:])), "state": state})
+
+@app.route("/sam")
+def sam_thinking_page():
+    return Response(SAM_THINKING_HTML, mimetype="text/html")
 
 @app.route("/")
 def index():
@@ -765,6 +1392,64 @@ def manifest():
     }
     return jsonify(m)
 
+def _build_crypto_data() -> dict:
+    """組合 /api/crypto 的數據（供 JSONBin 同步用）"""
+    import threading
+    ema_state   = load_bot_state()
+    nfes_state  = load_nfes_state()
+    live_prices = get_live_prices()
+
+    ema_positions = _build_positions(
+        ema_state.get("positions", {}), strategy="EMA99", live_prices=live_prices)
+    nfes_positions = _build_positions(
+        nfes_state.get("positions", {}),
+        strategy=nfes_state.get("strategy", "NFES 強化版"), live_prices=live_prices)
+
+    all_trades = []
+    for t in ema_state.get("trades", []):
+        tc = dict(t); tc["strategy"] = tc.get("strategy", "EMA99"); all_trades.append(tc)
+    for t in nfes_state.get("trades", []):
+        tc = dict(t); tc["strategy"] = tc.get("strategy", "NFES 強化版"); all_trades.append(tc)
+    recent = sorted(all_trades, key=lambda x: x.get("exit_ts", ""))
+
+    ema_capital = ema_state.get("capital", 0)
+    _record_daily_equity(ema_capital)
+    equity_curve = _get_equity_curve(ema_capital)
+    total_pnl = round(ema_capital - INITIAL_CAPITAL, 2)
+    last_run = max(
+        ema_state.get("last_run", ""), nfes_state.get("last_run", "")
+    ) or ema_state.get("last_run", "")
+
+    return {
+        "positions"    : ema_positions + nfes_positions,
+        "capital"      : round(ema_capital, 2),
+        "last_run"     : last_run,
+        "recent_trades": recent,
+        "equity_curve" : equity_curve,
+        "total_pnl"    : total_pnl,
+        "source"       : "local",
+    }
+
+
+def _jsonbin_sync_loop():
+    """背景執行緒：每 60 秒把最新狀態推送到 GitHub Gist，讓 Render 可以讀到"""
+    import threading
+    if not (GITHUB_TOKEN and GIST_ID):
+        return
+    def loop():
+        while True:
+            try:
+                data = _build_crypto_data()
+                ok = _gist_put(data)
+                print(f"[Gist sync] {'✅ 推送成功' if ok else '❌ 推送失敗'} capital={data.get('capital')}")
+            except Exception as e:
+                print(f"[Gist sync] 錯誤: {e}")
+            time.sleep(60)
+    t = threading.Thread(target=loop, daemon=True, name="gist-sync")
+    t.start()
+    print("✅ GitHub Gist 同步執行緒已啟動（每 60 秒推送）")
+
+
 if __name__ == "__main__":
     print("=" * 50)
     print("📊 投資組合 App 啟動中...")
@@ -776,4 +1461,5 @@ if __name__ == "__main__":
     except:
         pass
     print("=" * 50)
+    _jsonbin_sync_loop()
     app.run(host="0.0.0.0", port=5050, debug=False)
