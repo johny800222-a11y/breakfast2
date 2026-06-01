@@ -26,7 +26,7 @@ SAM_TRADES_FILE      = BASE_DIR / "brain" / "sams_brain_trades.json"
 SAM_STATE_FILE       = BASE_DIR / "brain" / "sams_brain_state.json"
 
 # GitHub Gist — 讓 Render 雲端也能讀到 bot 狀態
-GITHUB_TOKEN   = os.getenv("GITHUB_TOKEN", "")
+GITHUB_TOKEN   = os.getenv("GITHUB_TOKEN2", "")
 GIST_ID        = os.getenv("GIST_ID",      "627811c22b1d404fdcbb6115f81fd1e7")
 GIST_FILENAME  = "portfolio_state.json"
 
