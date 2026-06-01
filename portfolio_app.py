@@ -142,14 +142,13 @@ def to_binance_sym(ccxt_sym: str) -> str:
 # ─────────────────────────────────────────────────────────────────
 
 def load_bot_state() -> dict:
-    """優先讀本機 JSON（本機模式），否則從 Gist 讀（Render 雲端模式）"""
+    """優先讀本機 JSON（本機模式），否則從 Gist public raw URL 讀（Render 雲端模式）"""
     if BOT_STATE_FILE.exists():
         return json.loads(BOT_STATE_FILE.read_text())
-    # 雲端 Render：從 Gist 讀完整 portfolio 快照
-    if GITHUB_TOKEN and GIST_ID:
-        data = _gist_get()
-        if data:
-            return data
+    # 雲端 Render：從 Gist public raw URL 讀（不需要 token）
+    data = _gist_get()
+    if data:
+        return data
     return {}
 
 def load_nfes_state() -> dict:
